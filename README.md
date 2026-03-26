@@ -34,23 +34,25 @@ Otherwise Enter behaves normally.
 
 ### Configure the global default retry count
 
-You can change the default auto-retry count for all future pi sessions:
+You can open an interactive picker from either command:
+
+```bash
+/retry settings
+/retry:settings
+```
+
+The picker lets you select the retry setting and then choose a new value.
+
+You can also set values directly:
 
 ```bash
 /retry settings 7
-```
-
-You can also use the alias command:
-
-```bash
 /retry:settings 7
 ```
 
 Other useful forms:
 
 ```bash
-/retry settings        # show current setting
-/retry settings show   # show current setting
 /retry settings reset  # reset back to 5
 /retry settings 0      # disable auto-retry
 ```

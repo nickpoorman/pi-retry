@@ -246,7 +246,7 @@ export default function piRetry(pi: ExtensionAPI) {
 
   function showRetrySettings(ctx: any) {
     ctx.ui.notify(
-      `${formatRetrySettings(retryConfig)} Use /retry settings <count> or /retry:settings <count>. Config: ${CONFIG_FILE}`,
+      `${formatRetrySettings(retryConfig)} Use /retry settings to open the picker, or /retry settings <count>. Config: ${CONFIG_FILE}`,
       "info",
     );
   }
@@ -265,11 +265,113 @@ export default function piRetry(pi: ExtensionAPI) {
     ctx.ui.notify(message, "success");
   }
 
-  function handleRetrySettings(args: string | undefined, ctx: any) {
+  async function promptForCustomRetryCount(ctx: any): Promise<number | undefined> {
+    while (true) {
+      const currentValue = retryConfig.maxRetries === 0 ? "disabled (0)" : String(retryConfig.maxRetries);
+      const input = await ctx.ui.input(
+        "Set max auto-retries",
+        `Enter a whole number >= 0. Current: ${currentValue}`,
+      );
+
+      if (input === undefined) {
+        return undefined;
+      }
+
+      const maxRetries = parseRetryCount(input);
+      if (maxRetries !== null) {
+        return maxRetries;
+      }
+
+      ctx.ui.notify("Please enter a whole number 0 or greater.", "warning");
+    }
+  }
+
+  async function promptForRetryCount(ctx: any): Promise<number | undefined> {
+    const currentValue = retryConfig.maxRetries === 0 ? "disabled" : String(retryConfig.maxRetries);
+    const selected = await ctx.ui.select(
+      `Choose max auto-retries (current: ${currentValue})`,
+      [
+        "0 (disable auto-retry)",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5 (default)",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "Custom…",
+      ],
+    );
+
+    if (!selected) {
+      return undefined;
+    }
+
+    if (selected === "Custom…") {
+      return promptForCustomRetryCount(ctx);
+    }
+
+    const maxRetries = parseRetryCount(selected);
+    return maxRetries ?? undefined;
+  }
+
+  async function openRetrySettingsUI(ctx: any): Promise<void> {
+    if (!ctx.hasUI) {
+      showRetrySettings(ctx);
+      return;
+    }
+
+    const currentValue = retryConfig.maxRetries === 0 ? "disabled" : String(retryConfig.maxRetries);
+    const selected = await ctx.ui.select("Retry Settings", [
+      `Max auto-retries (current: ${currentValue})`,
+      retryConfig.maxRetries === 0 ? "Enable auto-retry" : "Disable auto-retry",
+      `Reset to default (${DEFAULT_MAX_RETRIES})`,
+      "Show config file path",
+    ]);
+
+    if (!selected) {
+      return;
+    }
+
+    if (selected.startsWith("Max auto-retries")) {
+      const maxRetries = await promptForRetryCount(ctx);
+      if (maxRetries !== undefined) {
+        updateRetrySettings(maxRetries, ctx);
+      }
+      return;
+    }
+
+    if (selected === "Disable auto-retry") {
+      updateRetrySettings(0, ctx);
+      return;
+    }
+
+    if (selected === "Enable auto-retry") {
+      const maxRetries = await promptForRetryCount(ctx);
+      if (maxRetries !== undefined) {
+        updateRetrySettings(maxRetries, ctx);
+      }
+      return;
+    }
+
+    if (selected.startsWith("Reset to default")) {
+      updateRetrySettings(DEFAULT_MAX_RETRIES, ctx);
+      return;
+    }
+
+    if (selected === "Show config file path") {
+      showRetrySettings(ctx);
+    }
+  }
+
+  async function handleRetrySettings(args: string | undefined, ctx: any): Promise<void> {
     const trimmed = (args ?? "").trim();
 
     if (!trimmed || /^(show|status)$/i.test(trimmed)) {
-      showRetrySettings(ctx);
+      await openRetrySettingsUI(ctx);
       return;
     }
 
@@ -281,7 +383,7 @@ export default function piRetry(pi: ExtensionAPI) {
     const maxRetries = parseRetryCount(trimmed);
     if (maxRetries === null) {
       ctx.ui.notify(
-        "Usage: /retry settings <count>, /retry settings show, or /retry settings reset",
+        "Usage: /retry settings, /retry settings <count>, or /retry settings reset",
         "warning",
       );
       return;
@@ -443,6 +545,11 @@ export default function piRetry(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
   pi.registerCommand("retry", {
     description: "Retry the last prompt, or manage auto-retry settings with `/retry settings ...`",
+    getArgumentCompletions: (prefix) => {
+      const options = ["settings", "settings reset", "settings 0", "settings 5", "settings 7"];
+      const filtered = options.filter((option) => option.startsWith(prefix));
+      return filtered.length > 0 ? filtered.map((option) => ({ value: option, label: option })) : null;
+    },
     handler: async (args, ctx) => {
       const trimmed = (args ?? "").trim();
       if (!trimmed) {
@@ -452,21 +559,26 @@ export default function piRetry(pi: ExtensionAPI) {
 
       const [subcommand, ...rest] = trimmed.split(/\s+/);
       if (subcommand.toLowerCase() === "settings") {
-        handleRetrySettings(rest.join(" "), ctx);
+        await handleRetrySettings(rest.join(" "), ctx);
         return;
       }
 
       ctx.ui.notify(
-        `Unknown /retry subcommand "${subcommand}". Use /retry or /retry settings <count>.`,
+        `Unknown /retry subcommand "${subcommand}". Use /retry or /retry settings.`,
         "warning",
       );
     },
   });
 
   pi.registerCommand("retry:settings", {
-    description: "Show or update the default auto-retry count",
+    description: "Open or update the default auto-retry count",
+    getArgumentCompletions: (prefix) => {
+      const options = ["reset", "0", "5", "7", "10"];
+      const filtered = options.filter((option) => option.startsWith(prefix));
+      return filtered.length > 0 ? filtered.map((option) => ({ value: option, label: option })) : null;
+    },
     handler: async (args, ctx) => {
-      handleRetrySettings(args, ctx);
+      await handleRetrySettings(args, ctx);
     },
   });
 

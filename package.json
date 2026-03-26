@@ -1,7 +1,7 @@
 {
   "name": "@georgebashi/pi-retry",
-  "version": "0.1.1",
-  "description": "pi extension: auto-retry transient streaming errors + /retry command",
+  "version": "0.1.2",
+  "description": "pi extension: auto-retry transient streaming errors + /retry settings",
   "keywords": [
     "pi-package",
     "retry",
@@ -12,7 +12,7 @@
   "author": "George Bashi <george@bashi.co.uk>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/georgebashi/pi-retry.git"
+    "url": "git+https://github.com/nickpoorman/pi-retry.git"
   },
   "type": "module",
   "files": [

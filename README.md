@@ -1,42 +1,80 @@
 # pi-retry
 
-A [pi](https://github.com/badlogic/pi) extension that retries failed LLM responses — automatically for transient streaming errors, manually via `/retry` or just pressing Enter.
+A [pi](https://github.com/badlogic/pi) extension that retries failed LLM responses — automatically for transient streaming errors, manually via `/retry` or Enter, and now with configurable default retry settings.
 
 ## Features
 
 ### Auto-retry transient errors
 
-When an LLM response fails with a transient streaming error (e.g. `"aborted"` from an upstream proxy/gateway), the extension automatically retries with exponential backoff:
+When an LLM response fails with a transient streaming error (for example `"aborted"` from an upstream proxy or gateway), the extension automatically retries with exponential backoff:
 
-- **Delays:** 2s → 4s → 8s
-- **Max attempts:** 3
-- **No history pollution:** The failed response is invisible to the model (pi's `transform-messages` strips aborted/errored assistant messages). The retry trigger uses `display: false` so it's hidden in the TUI.
+- **Default delays:** 2s → 4s → 8s → 16s → 32s
+- **Default max attempts:** 5
+- **Configurable max attempts:** change it globally with `/retry settings <count>`
+- **No history pollution:** the failed response is invisible to the model because pi strips aborted and errored assistant messages before the next request
 
-Only errors *not* already handled by pi's built-in retry are retried (overloaded, rate limit, 429, 5xx, etc. are left to pi). User-initiated aborts (ESC) are never auto-retried — use `/retry` or Enter for those.
+Only errors *not* already handled by pi's built-in retry are retried. User-initiated aborts (ESC) are never auto-retried — use `/retry` or Enter for those.
 
 ### Manual retry: `/retry`
 
-Type `/retry` after any error or abort to re-invoke the LLM. The model starts fresh from the last user message — it never sees the failed partial response.
+Type `/retry` after any error or abort to re-invoke the LLM. The model starts fresh from the last user message and never sees the failed partial response.
 
 ### Manual retry: press Enter
 
-After an error or user-initiated abort (ESC), just press Enter on an empty editor to retry. This is the fastest path for the common "oops, I shouldn't have cancelled" scenario.
+After an error or user-initiated abort (ESC), press Enter on an empty editor to retry.
 
-This works by intercepting raw terminal input via pi's `onTerminalInput` hook. The Enter keypress is consumed only when all of these are true:
+The Enter keypress is consumed only when all of these are true:
 
 - The editor is empty
-- The editor has focus (no modal/selector/overlay is open)
+- The editor has focus
 - The agent is idle
 - The last response was an error or abort
 
-Otherwise Enter behaves normally — including when a model selector, confirm dialog, session picker, or any other modal UI is displayed.
+Otherwise Enter behaves normally.
+
+### Configure the global default retry count
+
+You can change the default auto-retry count for all future pi sessions:
+
+```bash
+/retry settings 7
+```
+
+You can also use the alias command:
+
+```bash
+/retry:settings 7
+```
+
+Other useful forms:
+
+```bash
+/retry settings        # show current setting
+/retry settings show   # show current setting
+/retry settings reset  # reset back to 5
+/retry settings 0      # disable auto-retry
+```
+
+The setting is saved to:
+
+```text
+~/.pi/agent/extensions/pi-retry.json
+```
 
 ## Installation
 
-### As a pi package (recommended)
+### As a pi package
+
+From npm:
 
 ```bash
 pi install npm:@georgebashi/pi-retry
+```
+
+From this fork:
+
+```bash
+pi install git:github.com/nickpoorman/pi-retry
 ```
 
 Or from a local checkout:
@@ -60,16 +98,19 @@ Every retry attempt is logged to `~/.pi/logs/pi-retry.jsonl` with:
 - Attempt number and delay
 - Working directory and session ID
 
-Event types: `retry`, `retry_succeeded`, `retry_exhausted`, `manual_retry`.
+Event types:
+
+- `retry`
+- `retry_succeeded`
+- `retry_exhausted`
+- `manual_retry`
 
 ## How it works
 
-1. **`agent_end` event** — Checks if the last assistant message has a retryable error. If so, waits with backoff and sends a hidden `sendMessage` with `triggerTurn: true`.
-
-2. **`context` event** — Strips the hidden retry trigger message before the LLM sees it. The aborted assistant message is already stripped by pi's `transform-messages`.
-
-3. **`onTerminalInput` hook** — Intercepts Enter on empty editor to trigger manual retry. Consumes the keypress so it doesn't reach the editor.
-
-4. **`/retry` command** — Explicit retry for when you want to be deliberate about it.
-
-5. **`turn_end` event** — Resets the retry counter when a successful response comes through.
+1. **`agent_end`** checks whether the last assistant message failed with a retryable error.
+2. If it qualifies, the extension waits using exponential backoff and sends a hidden retry trigger.
+3. **`context`** removes the hidden trigger before the next LLM request.
+4. **`/retry`** manually retries the last failed prompt.
+5. **`/retry settings ...`** updates the global default retry count.
+6. **Empty Enter** retries the last failed prompt when the editor is focused and blank.
+7. **`turn_end`** resets the auto-retry counter after a successful response.

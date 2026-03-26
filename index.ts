@@ -1,13 +1,13 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { matchesKey, type TUI } from "@mariozechner/pi-tui";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 /**
  * pi-retry: Handles transient streaming errors + manual retry.
  *
- * Two features:
+ * Features:
  *
  * 1. **Auto-retry** — On `agent_end`, if the last assistant message has a
  *    retryable error not covered by pi's built-in retry, wait with exponential
@@ -20,6 +20,10 @@ import { join } from "node:path";
  *    editor retries the last prompt. Works for any aborted/errored
  *    response, including user-initiated ESC cancellations. Uses the
  *    `onTerminalInput` hook to intercept Enter before pi swallows it.
+ *
+ * 3. **Retry settings** — `/retry settings <count>` or `/retry:settings <count>`
+ *    updates the global default auto-retry count for current and future pi
+ *    sessions. The setting is stored in `~/.pi/agent/extensions/pi-retry.json`.
  *
  * History:
  *   The session is append-only, so we can't delete the aborted assistant
@@ -35,10 +39,16 @@ import { join } from "node:path";
 // Config
 // ---------------------------------------------------------------------------
 
-const MAX_RETRIES = 3;
+const DEFAULT_MAX_RETRIES = 5;
 const BASE_DELAY_MS = 2000;
 
 const RETRY_CUSTOM_TYPE = "__retry_trigger";
+const CONFIG_DIR = join(getAgentDir(), "extensions");
+const CONFIG_FILE = join(CONFIG_DIR, "pi-retry.json");
+
+interface RetryConfig {
+  maxRetries: number;
+}
 
 // Errors we retry that the built-in doesn't cover.
 const RETRYABLE_PATTERNS = /\baborted\b/i;
@@ -46,6 +56,65 @@ const RETRYABLE_PATTERNS = /\baborted\b/i;
 // Patterns already handled by pi's built-in retry — don't double-retry.
 const BUILTIN_RETRY_PATTERNS =
   /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i;
+
+function parseRetryCount(value: unknown): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^\d+$/.test(trimmed)) {
+      return Number.parseInt(trimmed, 10);
+    }
+  }
+
+  return null;
+}
+
+function loadRetryConfig(): RetryConfig {
+  if (!existsSync(CONFIG_FILE)) {
+    return { maxRetries: DEFAULT_MAX_RETRIES };
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as {
+      maxRetries?: unknown;
+    };
+    const maxRetries = parseRetryCount(parsed.maxRetries);
+    if (maxRetries !== null) {
+      return { maxRetries };
+    }
+
+    console.error(
+      `Warning: Invalid maxRetries in ${CONFIG_FILE}; using default ${DEFAULT_MAX_RETRIES}.`,
+    );
+  } catch (error) {
+    console.error(`Warning: Could not parse ${CONFIG_FILE}: ${String(error)}`);
+  }
+
+  return { maxRetries: DEFAULT_MAX_RETRIES };
+}
+
+function saveRetryConfig(config: RetryConfig): void {
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
+}
+
+function formatRetrySettings(config: RetryConfig): string {
+  if (config.maxRetries === 0) {
+    return "Auto-retry is disabled.";
+  }
+
+  return `Auto-retry is set to ${config.maxRetries} attempts.`;
+}
+
+function getCommandErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -122,6 +191,8 @@ function isEditorFocused(tui: TUI | null): boolean {
 // ---------------------------------------------------------------------------
 
 export default function piRetry(pi: ExtensionAPI) {
+  let retryConfig = loadRetryConfig();
+
   // -- Auto-retry state --
   let retryAttempt = 0;
   let lastErrorMessage = "";
@@ -136,6 +207,92 @@ export default function piRetry(pi: ExtensionAPI) {
 
   // TUI reference, captured via a no-op widget during session_start.
   let tuiRef: TUI | null = null;
+
+  function resetAutoRetryState() {
+    retryAttempt = 0;
+    lastErrorMessage = "";
+    lastStopReason = "";
+  }
+
+  function triggerManualRetry(ctx: any) {
+    if (!ctx.isIdle()) {
+      ctx.ui.notify("Agent is still running.", "warning");
+      return;
+    }
+
+    if (!lastResponseWasError) {
+      ctx.ui.notify("Nothing to retry — last response completed successfully.", "warning");
+      return;
+    }
+
+    const model = ctx.model;
+    logRetryEvent({
+      timestamp: new Date().toISOString(),
+      event: "manual_retry",
+      provider: model?.provider,
+      model: model?.name,
+      modelId: model?.id,
+      api: model?.api,
+      thinkingLevel: pi.getThinkingLevel(),
+      attempt: 1,
+      maxRetries: 1,
+      cwd: ctx.cwd,
+      sessionId: ctx.sessionManager.getSessionId(),
+      ...getContextFields(ctx),
+    });
+
+    triggerRetry(pi);
+  }
+
+  function showRetrySettings(ctx: any) {
+    ctx.ui.notify(
+      `${formatRetrySettings(retryConfig)} Use /retry settings <count> or /retry:settings <count>. Config: ${CONFIG_FILE}`,
+      "info",
+    );
+  }
+
+  function updateRetrySettings(value: number, ctx: any) {
+    retryConfig = { maxRetries: value };
+    saveRetryConfig(retryConfig);
+    resetAutoRetryState();
+    ctx.ui.setStatus("pi-retry", undefined);
+
+    const message =
+      value === 0
+        ? `Auto-retry disabled for current and future pi sessions. Config: ${CONFIG_FILE}`
+        : `Auto-retry max set to ${value} for current and future pi sessions. Config: ${CONFIG_FILE}`;
+
+    ctx.ui.notify(message, "success");
+  }
+
+  function handleRetrySettings(args: string | undefined, ctx: any) {
+    const trimmed = (args ?? "").trim();
+
+    if (!trimmed || /^(show|status)$/i.test(trimmed)) {
+      showRetrySettings(ctx);
+      return;
+    }
+
+    if (/^reset$/i.test(trimmed)) {
+      updateRetrySettings(DEFAULT_MAX_RETRIES, ctx);
+      return;
+    }
+
+    const maxRetries = parseRetryCount(trimmed);
+    if (maxRetries === null) {
+      ctx.ui.notify(
+        "Usage: /retry settings <count>, /retry settings show, or /retry settings reset",
+        "warning",
+      );
+      return;
+    }
+
+    try {
+      updateRetrySettings(maxRetries, ctx);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save retry settings: ${getCommandErrorMessage(error)}`, "error");
+    }
+  }
 
   // -----------------------------------------------------------------------
   // Reset auto-retry counter on successful responses
@@ -162,7 +319,7 @@ export default function piRetry(pi: ExtensionAPI) {
           stopReason: lastStopReason,
           errorMessage: lastErrorMessage,
           attempt: retryAttempt,
-          maxRetries: MAX_RETRIES,
+          maxRetries: retryConfig.maxRetries,
           cwd: ctx.cwd,
           sessionId: ctx.sessionManager.getSessionId(),
           ...getContextFields(ctx),
@@ -170,9 +327,7 @@ export default function piRetry(pi: ExtensionAPI) {
 
         ctx.ui.notify(`Retry succeeded on attempt ${retryAttempt}.`, "info");
         ctx.ui.setStatus("pi-retry", undefined);
-        retryAttempt = 0;
-        lastErrorMessage = "";
-        lastStopReason = "";
+        resetAutoRetryState();
       }
     }
   });
@@ -215,13 +370,15 @@ export default function piRetry(pi: ExtensionAPI) {
     // Check our patterns.
     if (!RETRYABLE_PATTERNS.test(errorMessage)) return;
 
+    if (retryConfig.maxRetries === 0) return;
+
     retryAttempt++;
     lastErrorMessage = errorMessage;
     lastStopReason = stopReason;
 
     const model = ctx.model;
 
-    if (retryAttempt > MAX_RETRIES) {
+    if (retryAttempt > retryConfig.maxRetries) {
       logRetryEvent({
         timestamp: new Date().toISOString(),
         event: "retry_exhausted",
@@ -233,7 +390,7 @@ export default function piRetry(pi: ExtensionAPI) {
         stopReason,
         errorMessage,
         attempt: retryAttempt - 1,
-        maxRetries: MAX_RETRIES,
+        maxRetries: retryConfig.maxRetries,
         cwd: ctx.cwd,
         sessionId: ctx.sessionManager.getSessionId(),
         messageCount: messages.length,
@@ -241,13 +398,11 @@ export default function piRetry(pi: ExtensionAPI) {
       });
 
       ctx.ui.notify(
-        `Stream error persisted after ${MAX_RETRIES} retries: ${errorMessage}`,
+        `Stream error persisted after ${retryConfig.maxRetries} retries: ${errorMessage}`,
         "error",
       );
       ctx.ui.setStatus("pi-retry", undefined);
-      retryAttempt = 0;
-      lastErrorMessage = "";
-      lastStopReason = "";
+      resetAutoRetryState();
       return;
     }
 
@@ -264,7 +419,7 @@ export default function piRetry(pi: ExtensionAPI) {
       stopReason,
       errorMessage,
       attempt: retryAttempt,
-      maxRetries: MAX_RETRIES,
+      maxRetries: retryConfig.maxRetries,
       delayMs,
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
@@ -274,7 +429,7 @@ export default function piRetry(pi: ExtensionAPI) {
 
     ctx.ui.setStatus(
       "pi-retry",
-      `Stream error "${errorMessage}", retrying (${retryAttempt}/${MAX_RETRIES}) in ${(delayMs / 1000).toFixed(0)}s…`,
+      `Stream error "${errorMessage}", retrying (${retryAttempt}/${retryConfig.maxRetries}) in ${(delayMs / 1000).toFixed(0)}s…`,
     );
 
     await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -284,38 +439,34 @@ export default function piRetry(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Manual retry: /retry command
+  // Manual retry and settings commands
   // -----------------------------------------------------------------------
   pi.registerCommand("retry", {
-    description: "Retry the last prompt (use after aborted or errored responses)",
-    handler: async (_args, ctx) => {
-      if (!ctx.isIdle()) {
-        ctx.ui.notify("Agent is still running.", "warning");
+    description: "Retry the last prompt, or manage auto-retry settings with `/retry settings ...`",
+    handler: async (args, ctx) => {
+      const trimmed = (args ?? "").trim();
+      if (!trimmed) {
+        triggerManualRetry(ctx);
         return;
       }
 
-      if (!lastResponseWasError) {
-        ctx.ui.notify("Nothing to retry — last response completed successfully.", "warning");
+      const [subcommand, ...rest] = trimmed.split(/\s+/);
+      if (subcommand.toLowerCase() === "settings") {
+        handleRetrySettings(rest.join(" "), ctx);
         return;
       }
 
-      const model = ctx.model;
-      logRetryEvent({
-        timestamp: new Date().toISOString(),
-        event: "manual_retry",
-        provider: model?.provider,
-        model: model?.name,
-        modelId: model?.id,
-        api: model?.api,
-        thinkingLevel: pi.getThinkingLevel(),
-        attempt: 1,
-        maxRetries: 1,
-        cwd: ctx.cwd,
-        sessionId: ctx.sessionManager.getSessionId(),
-        ...getContextFields(ctx),
-      });
+      ctx.ui.notify(
+        `Unknown /retry subcommand "${subcommand}". Use /retry or /retry settings <count>.`,
+        "warning",
+      );
+    },
+  });
 
-      triggerRetry(pi);
+  pi.registerCommand("retry:settings", {
+    description: "Show or update the default auto-retry count",
+    handler: async (args, ctx) => {
+      handleRetrySettings(args, ctx);
     },
   });
 
@@ -331,6 +482,8 @@ export default function piRetry(pi: ExtensionAPI) {
   // otherwise the modal can't be interacted with.
   // -----------------------------------------------------------------------
   pi.on("session_start", async (_event, ctx) => {
+    retryConfig = loadRetryConfig();
+
     // Capture TUI reference via a zero-height widget factory. The factory
     // is called once with the TUI instance; we stash it and return an
     // invisible component (empty render, no height).
